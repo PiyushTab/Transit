@@ -43,7 +43,7 @@ Use the question box to request route rankings, compare bus and metro performanc
 
 ## Deploy on Render
 
-The included `render.yaml` defines a free Python web service. In Render, choose **New → Blueprint**, connect this repository, and apply the Blueprint. Render deploys the app to a public `onrender.com` URL. Free services sleep after 15 minutes without traffic and may take about a minute to wake. Uploaded data is in memory only and clears when the service restarts or the browser session expires.
+The included `render.yaml` defines a free Python web service. In Render, choose **New → Blueprint**, connect this repository, and apply the Blueprint. Render deploys the app to a public `onrender.com` URL. Free services sleep after 15 minutes without traffic and may take about a minute to wake. Free services use ephemeral local storage, so hosted uploads may be lost on restart or redeploy.
 
 ### Database storage
 

@@ -3,7 +3,7 @@ services:
     name: transit-reliability-analyzer
     runtime: python
     plan: free
-    buildCommand: python3 -m py_compile server.py
+    buildCommand: pip install -r requirements.txt && python3 -m py_compile server.py
     startCommand: python3 server.py
     healthCheckPath: /healthz
     envVars:

@@ -1,6 +1,6 @@
 # Transit Reliability Analyzer
 
-A dashboard for inspecting public transport delays. It uses Python's standard library for the server and works with generated sample telemetry or an uploaded CSV. Uploaded content is held temporarily in server memory and isolated to the visitor's browser session; it is removed when that session expires or the service restarts.
+A dashboard for inspecting public transport delays. Its Python backend provides APIs for CSV uploads, analytics, and questions. Each visitor's upload is isolated to their browser session and saved in a local SQLite database. Set `DATABASE_URL` to use PostgreSQL for persistence across server restarts. Sessions expire after 12 hours.
 
 ## Run
 
@@ -44,3 +44,7 @@ Use the question box to request route rankings, compare bus and metro performanc
 ## Deploy on Render
 
 The included `render.yaml` defines a free Python web service. In Render, choose **New → Blueprint**, connect this repository, and apply the Blueprint. Render deploys the app to a public `onrender.com` URL. Free services sleep after 15 minutes without traffic and may take about a minute to wake. Uploaded data is in memory only and clears when the service restarts or the browser session expires.
+
+### Database storage
+
+Local runs use `transit.sqlite3` beside `server.py`. For hosted persistence, set `DATABASE_URL` to a PostgreSQL connection string; the backend creates its session table automatically and stores each visitor's uploaded data separately. Without `DATABASE_URL`, Render uses SQLite on its ephemeral filesystem, so data can be lost when the free service restarts, spins down, or redeploys. Render's free Postgres databases expire after 30 days; choose a paid database plan for longer-term storage.

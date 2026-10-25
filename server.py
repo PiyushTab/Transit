@@ -9,9 +9,11 @@ import math
 import os
 import random
 import secrets
+import sqlite3
 import statistics
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +26,70 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 SESSIONS: dict[str, dict] = {}
 SESSION_LOCK = threading.RLock()
 DEMO_DATA: list[dict] | None = None
+STORE = None
+
+
+class SessionStore:
+    """Persist visitor uploads locally or in Postgres when DATABASE_URL is set."""
+
+    def __init__(self):
+        self.database_url = os.environ.get("DATABASE_URL", "").strip()
+        if self.database_url:
+            try:
+                import psycopg
+            except ImportError as exc:
+                raise RuntimeError("DATABASE_URL is set, but psycopg is not installed.") from exc
+            self._connect = lambda: psycopg.connect(self.database_url.replace("postgres://", "postgresql://", 1))
+            self._placeholder = "%s"
+        else:
+            path = Path(os.environ.get("TRANSIT_DB_PATH", ROOT / "transit.sqlite3"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._connect = lambda: sqlite3.connect(path, timeout=10)
+            self._placeholder = "?"
+        self._initialize()
+
+    def _initialize(self):
+        with closing(self._connect()) as connection, connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS transit_sessions (
+                session_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                last_seen DOUBLE PRECISION NOT NULL
+            )""")
+
+    def load(self, session_id: str, now: float):
+        p = self._placeholder
+        with closing(self._connect()) as connection, connection:
+            connection.execute(f"DELETE FROM transit_sessions WHERE last_seen < {p}", (now - SESSION_TTL,))
+            row = connection.execute(
+                f"SELECT payload FROM transit_sessions WHERE session_id = {p} AND last_seen >= {p}",
+                (session_id, now - SESSION_TTL),
+            ).fetchone()
+            if row is None:
+                return None
+            payload = json.loads(row[0])
+            connection.execute(f"UPDATE transit_sessions SET last_seen = {p} WHERE session_id = {p}", (now, session_id))
+            return payload
+
+    def save(self, session_id: str, state: dict, now: float):
+        p = self._placeholder
+        payload = json.dumps({"data": state["data"], "audit": state["audit"]}, separators=(",", ":"))
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                f"""INSERT INTO transit_sessions(session_id, payload, last_seen) VALUES ({p}, {p}, {p})
+                ON CONFLICT(session_id) DO UPDATE SET payload = excluded.payload, last_seen = excluded.last_seen""",
+                (session_id, payload, now),
+            )
+
+    def delete(self, session_id: str):
+        with closing(self._connect()) as connection, connection:
+            connection.execute(f"DELETE FROM transit_sessions WHERE session_id = {self._placeholder}", (session_id,))
+
+
+def session_store() -> SessionStore:
+    global STORE
+    if STORE is None:
+        STORE = SessionStore()
+    return STORE
 
 
 def demo_state() -> dict:
@@ -147,14 +213,17 @@ class Handler(BaseHTTPRequestHandler):
             for sid in expired:
                 SESSIONS.pop(sid, None)
             if session_id not in SESSIONS:
-                session_id = secrets.token_urlsafe(32)
-                state = demo_state()
+                state = session_store().load(session_id, now) if session_id else None
+                if state is None:
+                    session_id = secrets.token_urlsafe(32)
+                    state = demo_state()
+                    self.new_session_cookie = session_id
                 state["last_seen"] = now
                 SESSIONS[session_id] = state
-                self.new_session_cookie = session_id
             else:
                 SESSIONS[session_id]["last_seen"] = now
             self.session_state = SESSIONS[session_id]
+            self.session_id = session_id
         return self.session_state
 
     def send(self, code, body, typ="application/json"):
@@ -206,7 +275,7 @@ class Handler(BaseHTTPRequestHandler):
             state=self.get_session(); data=self.filtered(parse_qs(urlparse(self.path).query)); self.send(200,json.dumps(analytics(data,state["audit"]))); return
         if path=="/api/data": self.get_session(); self.send(200,json.dumps(self.filtered(parse_qs(urlparse(self.path).query)))); return
         if path=="/api/sample":
-            state=self.get_session(); state.update(demo_state()); self.send(200,json.dumps(analytics(state["data"],state["audit"]))); return
+            state=self.get_session(); session_store().delete(self.session_id); state.update(demo_state()); self.send(200,json.dumps(analytics(state["data"],state["audit"]))); return
         self.send(404,"{}")
 
     def do_POST(self):
@@ -216,6 +285,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload=self.read_json()
                 rows,audit=clean_csv(payload.get("csv","")); audit["source"]=str(payload.get("name","Uploaded CSV"))[:160]
+                session_store().save(self.session_id, {"data": rows, "audit": audit}, time.time())
                 with SESSION_LOCK: state["data"],state["audit"]=rows,audit
                 self.send(200,json.dumps(analytics(rows,audit)))
             except Exception as e: self.send(400,json.dumps({"error":str(e)}))

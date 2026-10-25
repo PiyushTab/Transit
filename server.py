@@ -8,15 +8,30 @@ import json
 import math
 import os
 import random
+import secrets
 import statistics
+import threading
+import time
 from datetime import datetime, timedelta
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 ROOT = Path(__file__).parent
-DATA: list[dict] = []
-AUDIT: dict = {}
+SESSION_TTL = 12 * 60 * 60
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+SESSIONS: dict[str, dict] = {}
+SESSION_LOCK = threading.RLock()
+DEMO_DATA: list[dict] | None = None
+
+
+def demo_state() -> dict:
+    global DEMO_DATA
+    if DEMO_DATA is None:
+        DEMO_DATA = make_demo()
+    return {"data": DEMO_DATA, "audit": {"input": len(DEMO_DATA), "valid": len(DEMO_DATA), "rejected": 0,
+            "duplicates": 0, "retention": 100, "imputed": 0, "source": "Generated sample"}}
 
 
 def make_demo() -> list[dict]:
@@ -89,8 +104,9 @@ def percentile(values: list[float], p: float) -> float:
     return s[lo] + (s[hi]-s[lo])*(pos-lo)
 
 
-def analytics(rows: list[dict]) -> dict:
-    if not rows: return {"kpis":{"trips":0,"routes":0,"otp":0,"mean":0,"p95":0,"bti":0,"ewt":0},"routes":[],"hourly":[{"hour":h,"delay":0,"trips":0} for h in range(24)],"forecast":[{"step":i+1,"delay":0} for i in range(48)],"audit":AUDIT}
+def analytics(rows: list[dict], audit: dict | None = None) -> dict:
+    audit = audit or {}
+    if not rows: return {"kpis":{"trips":0,"routes":0,"otp":0,"mean":0,"p95":0,"bti":0,"ewt":0},"routes":[],"hourly":[{"hour":h,"delay":0,"trips":0} for h in range(24)],"forecast":[{"step":i+1,"delay":0} for i in range(48)],"audit":audit}
     delays = [float(r["delay_min"]) for r in rows]
     mean = statistics.mean(delays); p95 = percentile(delays, .95)
     routes = []
@@ -110,20 +126,66 @@ def analytics(rows: list[dict]) -> dict:
         scheduled=statistics.mean(headways)
         actual=statistics.mean([h*h for h in headways])/(2*scheduled)
         ewt=max(0, actual-scheduled/2)
-    return {"kpis":{"trips":len(rows),"routes":len(routes),"otp":round(sum(-1<=d<=5 for d in delays)/len(delays)*100,1),"mean":round(mean,2),"p95":round(p95,2),"bti":round((p95-mean)/max(mean,1),2),"ewt":round(ewt,2)},"routes":routes,"hourly":hourly,"forecast":[{"step":i+1,"delay":round(max(0, (hourly[(datetime.now().hour+i)%24]["delay"]*.55 + statistics.mean([h["delay"] for h in hourly])*.45) + math.sin((datetime.now().hour+i)*math.pi/12)*.5),2)} for i in range(48)],"audit":AUDIT}
+    return {"kpis":{"trips":len(rows),"routes":len(routes),"otp":round(sum(-1<=d<=5 for d in delays)/len(delays)*100,1),"mean":round(mean,2),"p95":round(p95,2),"bti":round((p95-mean)/max(mean,1),2),"ewt":round(ewt,2)},"routes":routes,"hourly":hourly,"forecast":[{"step":i+1,"delay":round(max(0, (hourly[(datetime.now().hour+i)%24]["delay"]*.55 + statistics.mean([h["delay"] for h in hourly])*.45) + math.sin((datetime.now().hour+i)*math.pi/12)*.5),2)} for i in range(48)],"audit":audit}
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
+
+    def get_session(self):
+        if hasattr(self, "session_state"):
+            return self.session_state
+        jar = SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie", ""))
+        except Exception:
+            pass
+        session_id = jar.get("transit_session").value if jar.get("transit_session") else ""
+        now = time.time()
+        with SESSION_LOCK:
+            expired = [sid for sid, state in SESSIONS.items() if now-state["last_seen"] > SESSION_TTL]
+            for sid in expired:
+                SESSIONS.pop(sid, None)
+            if session_id not in SESSIONS:
+                session_id = secrets.token_urlsafe(32)
+                state = demo_state()
+                state["last_seen"] = now
+                SESSIONS[session_id] = state
+                self.new_session_cookie = session_id
+            else:
+                SESSIONS[session_id]["last_seen"] = now
+            self.session_state = SESSIONS[session_id]
+        return self.session_state
+
     def send(self, code, body, typ="application/json"):
         b=body if isinstance(body,bytes) else body.encode()
-        self.send_response(code); self.send_header("Content-Type",typ); self.send_header("Content-Length",str(len(b))); self.send_header("Access-Control-Allow-Origin","*"); self.end_headers(); self.wfile.write(b)
+        self.send_response(code)
+        self.send_header("Content-Type",typ)
+        self.send_header("Content-Length",str(len(b)))
+        self.send_header("X-Content-Type-Options","nosniff")
+        self.send_header("Cache-Control","no-store")
+        if getattr(self,"new_session_cookie",None):
+            cookie=f"transit_session={self.new_session_cookie}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax"
+            if os.environ.get("COOKIE_SECURE","0").lower() in ("1","true","yes"):
+                cookie += "; Secure"
+            self.send_header("Set-Cookie",cookie)
+        self.end_headers()
+        try: self.wfile.write(b)
+        except (BrokenPipeError,ConnectionResetError): pass
+
+    def read_json(self):
+        length=int(self.headers.get("Content-Length",0))
+        if length<=0: raise ValueError("Request body is empty.")
+        if length>MAX_UPLOAD_BYTES: raise ValueError("Request is too large (5 MB maximum).")
+        return json.loads(self.rfile.read(length))
+
     def filtered(self, params):
+        rows=self.get_session()["data"]
         route=params.get("route",[""])[0]; mode=params.get("mode",[""])[0]; weather=params.get("weather",[""])[0]
         start=params.get("start",[""])[0]; end=params.get("end",[""])[0]
         traffic=float(params.get("traffic",["0"])[0] or 0); rain=float(params.get("rain",["0"])[0] or 0)
         result=[]
-        for r in DATA:
+        for r in rows:
             if route and r["route_id"]!=route: continue
             if mode and r["mode"].lower()!=mode.lower(): continue
             if weather and r.get("weather","").lower()!=weather.lower(): continue
@@ -135,30 +197,34 @@ class Handler(BaseHTTPRequestHandler):
             result.append(row)
         return result
     def do_GET(self):
-        global DATA, AUDIT
         path=urlparse(self.path).path
-        if path=="/api/analytics":
-            data=self.filtered(parse_qs(urlparse(self.path).query)); self.send(200,json.dumps(analytics(data))); return
-        if path=="/api/data": self.send(200,json.dumps(self.filtered(parse_qs(urlparse(self.path).query)))); return
-        if path=="/api/sample":
-            DATA=make_demo(); AUDIT={"input":len(DATA),"valid":len(DATA),"rejected":0,"duplicates":0,"retention":100,"imputed":0,"source":"Generated sample"}; self.send(200,json.dumps(analytics(DATA))); return
-        if path=="/": self.send(200,(ROOT/"index.html").read_bytes(),"text/html; charset=utf-8"); return
+        if path=="/healthz": self.send(200,json.dumps({"status":"ok"})); return
+        if path=="/": self.get_session(); self.send(200,(ROOT/"index.html").read_bytes(),"text/html; charset=utf-8"); return
         if path=="/style.css": self.send(200,(ROOT/"style.css").read_bytes(),"text/css; charset=utf-8"); return
         if path=="/app.js": self.send(200,(ROOT/"app.js").read_bytes(),"text/javascript; charset=utf-8"); return
+        if path=="/api/analytics":
+            state=self.get_session(); data=self.filtered(parse_qs(urlparse(self.path).query)); self.send(200,json.dumps(analytics(data,state["audit"]))); return
+        if path=="/api/data": self.get_session(); self.send(200,json.dumps(self.filtered(parse_qs(urlparse(self.path).query)))); return
+        if path=="/api/sample":
+            state=self.get_session(); state.update(demo_state()); self.send(200,json.dumps(analytics(state["data"],state["audit"]))); return
         self.send(404,"{}")
+
     def do_POST(self):
-        global DATA,AUDIT
-        if self.path=="/api/upload":
+        path=urlparse(self.path).path
+        state=self.get_session()
+        if path=="/api/upload":
             try:
-                payload=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
-                DATA,AUDIT=clean_csv(payload.get("csv","")); AUDIT["source"]=payload.get("name","Uploaded CSV")
-                self.send(200,json.dumps(analytics(DATA)))
+                payload=self.read_json()
+                rows,audit=clean_csv(payload.get("csv","")); audit["source"]=str(payload.get("name","Uploaded CSV"))[:160]
+                with SESSION_LOCK: state["data"],state["audit"]=rows,audit
+                self.send(200,json.dumps(analytics(rows,audit)))
             except Exception as e: self.send(400,json.dumps({"error":str(e)}))
-        elif self.path=="/api/ask":
+        elif path=="/api/ask":
             try:
-                payload=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
-                q=payload.get("question","").lower().strip(); a=analytics(self.filtered({k:[str(v)] for k,v in payload.get("filters",{}).items()})); k=a["kpis"]
+                payload=self.read_json()
+                q=payload.get("question","").lower().strip(); a=analytics(self.filtered({k:[str(v)] for k,v in payload.get("filters",{}).items()}),state["audit"]); k=a["kpis"]
                 if not q: answer="Type a question about the loaded transit data."
+                elif not k["trips"]: answer="No trips match the current filters. Reset or adjust the filters and try again."
                 elif any(w in q for w in ("worst","unreliable","lowest","bad")):
                     r=min(a["routes"],key=lambda x:x["otp"]); answer=f"{r['route_id']} ({r['name']}) has the lowest on-time performance at {r['otp']}%, with a mean delay of {r['mean']} minutes and a 95th-percentile delay of {r['p95']} minutes."
                 elif any(w in q for w in ("best","reliable","highest","top")):
@@ -188,7 +254,7 @@ class Handler(BaseHTTPRequestHandler):
         else: self.send(404,"{}")
 
 if __name__=="__main__":
-    DATA=make_demo(); AUDIT={"input":len(DATA),"valid":len(DATA),"rejected":0,"duplicates":0,"retention":100,"imputed":0,"source":"Generated sample"}
     port = int(os.environ.get("PORT", "8000"))
-    print(f"Transit Reliability Analyzer running at http://localhost:{port}")
-    ThreadingHTTPServer(("127.0.0.1",port),Handler).serve_forever()
+    host = os.environ.get("HOST", "0.0.0.0" if "PORT" in os.environ else "127.0.0.1")
+    print(f"Transit Reliability Analyzer listening on {host}:{port}")
+    ThreadingHTTPServer((host,port),Handler).serve_forever()

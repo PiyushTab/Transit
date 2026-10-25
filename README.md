@@ -1,6 +1,6 @@
 # Transit Reliability Analyzer
 
-A local dashboard for inspecting public transport delays. It uses Python's standard library for the server and works with generated sample telemetry or an uploaded CSV. Uploaded content is handled by the local server and kept in memory for that running session.
+A dashboard for inspecting public transport delays. It uses Python's standard library for the server and works with generated sample telemetry or an uploaded CSV. Uploaded content is held temporarily in server memory and isolated to the visitor's browser session; it is removed when that session expires or the service restarts.
 
 ## Run
 
@@ -40,3 +40,7 @@ Use the question box to request route rankings, compare bus and metro performanc
 - BTI = (95th percentile delay − mean delay) / max(mean delay, 1 minute).
 - Excess wait time is estimated from provided headways. If headways aren't included, it reports 0 and the dashboard labels that data as insufficient in the answer.
 - Forecast is a 48-hour seasonal baseline based on observed hourly delays. It is not a live operational prediction.
+
+## Deploy on Render
+
+The included `render.yaml` defines a free Python web service. In Render, choose **New → Blueprint**, connect this repository, and apply the Blueprint. Render deploys the app to a public `onrender.com` URL. Free services sleep after 15 minutes without traffic and may take about a minute to wake. Uploaded data is in memory only and clears when the service restarts or the browser session expires.

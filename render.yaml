@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: transit-reliability-analyzer
+    runtime: python
+    plan: free
+    buildCommand: python3 -m py_compile server.py
+    startCommand: python3 server.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: COOKIE_SECURE
+        value: "1"

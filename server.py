@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Public Transport Delay & Reliability Analyzer — dependency-free local app."""
+from __future__ import annotations
+
+import csv
+import io
+import json
+import math
+import os
+import random
+import statistics
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+ROOT = Path(__file__).parent
+DATA: list[dict] = []
+AUDIT: dict = {}
+
+
+def make_demo() -> list[dict]:
+    rng = random.Random(42)
+    routes = [("BUS-101", "Downtown Express", "Bus", .85), ("BUS-204", "Cross-Town Shuttle", "Bus", .7),
+              ("METRO-M1", "Red Line", "Metro", .08), ("TRAM-T3", "Riverside Line", "Tram", .35),
+              ("RAIL-C2", "Regional South", "Rail", .12)]
+    start = datetime(2026, 9, 1)
+    rows = []
+    for day in range(28):
+        for route, name, mode, exposure in routes:
+            for trip in range(26):
+                hour = rng.choice([6, 7, 8, 9, 12, 15, 16, 17, 18, 20])
+                rush = (hour in (7, 8, 9, 16, 17, 18))
+                delay = max(-4, rng.gauss(1.0 + exposure * (3.2 if rush else .8), 1.3 + exposure * 2))
+                if rng.random() < .025: delay += rng.uniform(8, 22)
+                sched = start + timedelta(days=day, hours=hour, minutes=trip*2)
+                rows.append({"route_id": route, "route_name": name, "mode": mode, "trip_id": f"{route}-{day}-{trip}",
+                             "scheduled_time": sched.isoformat(), "actual_time": (sched+timedelta(minutes=delay)).isoformat(),
+                             "delay_min": round(delay, 2), "headway_min": round(max(3, rng.gauss(12 if mode == "Bus" else 8, 2)), 2),
+                             "weather": rng.choice(["Clear", "Clear", "Clear", "Rain"]), "hour": hour})
+    return rows
+
+
+def clean_csv(raw: str) -> tuple[list[dict], dict]:
+    reader = csv.DictReader(io.StringIO(raw.lstrip("\ufeff")))
+    if not reader.fieldnames: raise ValueError("The CSV has no header row.")
+    aliases = {"route_id": ["route_id", "route", "line", "routeid"], "trip_id": ["trip_id", "trip", "vehicle_trip"],
+               "scheduled_time": ["scheduled_time", "scheduled", "scheduled_arrival", "sched_time"],
+               "actual_time": ["actual_time", "actual", "actual_arrival", "arrival_time"],
+               "delay_min": ["delay_min", "delay_minutes", "delay", "delay_mins"],
+               "route_name": ["route_name", "name"], "mode": ["mode", "transport_mode"], "headway_min": ["headway_min", "headway"]}
+    names = {str(n).strip().lower().replace(" ", "_"): n for n in reader.fieldnames}
+    cols = {key: next((names[a] for a in options if a in names), None) for key, options in aliases.items()}
+    if not cols["delay_min"] and not (cols["scheduled_time"] and cols["actual_time"]):
+        raise ValueError("CSV needs delay_min, or both scheduled_time and actual_time columns. Optional: route_id, trip_id, mode, headway_min.")
+    rows, rejected, seen, duplicates, imputed = [], 0, set(), 0, 0
+    for source in reader:
+        get = lambda k: (source.get(cols[k], "") or "").strip() if cols[k] else ""
+        route = get("route_id") or "UNSPECIFIED"
+        trip = get("trip_id")
+        key = (trip, get("scheduled_time")) if trip else None
+        if key and key in seen: duplicates += 1; continue
+        if key: seen.add(key)
+        try:
+            if get("delay_min"):
+                delay = float(get("delay_min"))
+            else:
+                a, b = datetime.fromisoformat(get("actual_time").replace("Z", "+00:00")), datetime.fromisoformat(get("scheduled_time").replace("Z", "+00:00"))
+                delay = (a-b).total_seconds()/60
+            if not math.isfinite(delay) or delay < -30 or delay > 180: raise ValueError
+            hour = 12
+            stamp = get("scheduled_time")
+            if stamp:
+                try: hour = datetime.fromisoformat(stamp.replace("Z", "+00:00")).hour
+                except ValueError: pass
+            rows.append({"route_id": route.upper().replace("_", "-"), "route_name": get("route_name") or route,
+                         "mode": get("mode") or "Unknown", "trip_id": trip, "delay_min": delay,
+                         "headway_min": float(get("headway_min") or 0), "hour": hour, "weather": source.get("weather", "Unknown"),
+                         "scheduled_time": stamp, "service_date": stamp[:10] if len(stamp) >= 10 else ""})
+        except (ValueError, TypeError): rejected += 1
+    if not rows: raise ValueError("No valid records found. Check timestamps and delay values.")
+    return rows, {"input": sum(1 for _ in []) + len(rows) + rejected + duplicates, "valid": len(rows), "rejected": rejected, "duplicates": duplicates, "retention": round(100*len(rows)/max(1,len(rows)+rejected+duplicates),1), "imputed": imputed}
+
+
+def percentile(values: list[float], p: float) -> float:
+    s = sorted(values)
+    if len(s) == 1: return s[0]
+    pos = (len(s)-1)*p; lo = int(pos); hi = min(lo+1,len(s)-1)
+    return s[lo] + (s[hi]-s[lo])*(pos-lo)
+
+
+def analytics(rows: list[dict]) -> dict:
+    if not rows: return {"kpis":{"trips":0,"routes":0,"otp":0,"mean":0,"p95":0,"bti":0,"ewt":0},"routes":[],"hourly":[{"hour":h,"delay":0,"trips":0} for h in range(24)],"forecast":[{"step":i+1,"delay":0} for i in range(48)],"audit":AUDIT}
+    delays = [float(r["delay_min"]) for r in rows]
+    mean = statistics.mean(delays); p95 = percentile(delays, .95)
+    routes = []
+    byroute = {}
+    for r in rows: byroute.setdefault(r["route_id"], []).append(r)
+    for rid, rr in sorted(byroute.items()):
+        ds = [float(r["delay_min"]) for r in rr]; avg = statistics.mean(ds); p = percentile(ds,.95)
+        otp = sum(-1 <= d <= 5 for d in ds)/len(ds)*100
+        bti = (p-avg)/max(avg,1)
+        routes.append({"route_id":rid,"name":rr[0]["route_name"],"mode":rr[0]["mode"],"trips":len(ds),"otp":round(otp,1),"mean":round(avg,2),"p95":round(p,2),"bti":round(bti,2),"grade":"A+" if otp>=93 else "A" if otp>=88 else "B" if otp>=80 else "C"})
+    byhour={i:[] for i in range(24)}
+    for r in rows: byhour[int(r.get("hour",12))%24].append(float(r["delay_min"]))
+    hourly=[{"hour":h,"delay":round(statistics.mean(v),2) if v else 0,"trips":len(v)} for h,v in byhour.items()]
+    ewt=0
+    headways=[float(r.get("headway_min",0)) for r in rows if float(r.get("headway_min",0))>0]
+    if headways:
+        scheduled=statistics.mean(headways)
+        actual=statistics.mean([h*h for h in headways])/(2*scheduled)
+        ewt=max(0, actual-scheduled/2)
+    return {"kpis":{"trips":len(rows),"routes":len(routes),"otp":round(sum(-1<=d<=5 for d in delays)/len(delays)*100,1),"mean":round(mean,2),"p95":round(p95,2),"bti":round((p95-mean)/max(mean,1),2),"ewt":round(ewt,2)},"routes":routes,"hourly":hourly,"forecast":[{"step":i+1,"delay":round(max(0, (hourly[(datetime.now().hour+i)%24]["delay"]*.55 + statistics.mean([h["delay"] for h in hourly])*.45) + math.sin((datetime.now().hour+i)*math.pi/12)*.5),2)} for i in range(48)],"audit":AUDIT}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def send(self, code, body, typ="application/json"):
+        b=body if isinstance(body,bytes) else body.encode()
+        self.send_response(code); self.send_header("Content-Type",typ); self.send_header("Content-Length",str(len(b))); self.send_header("Access-Control-Allow-Origin","*"); self.end_headers(); self.wfile.write(b)
+    def filtered(self, params):
+        route=params.get("route",[""])[0]; mode=params.get("mode",[""])[0]; weather=params.get("weather",[""])[0]
+        start=params.get("start",[""])[0]; end=params.get("end",[""])[0]
+        traffic=float(params.get("traffic",["0"])[0] or 0); rain=float(params.get("rain",["0"])[0] or 0)
+        result=[]
+        for r in DATA:
+            if route and r["route_id"]!=route: continue
+            if mode and r["mode"].lower()!=mode.lower(): continue
+            if weather and r.get("weather","").lower()!=weather.lower(): continue
+            day=r.get("service_date","") or str(r.get("scheduled_time",""))[:10]
+            if start and (not day or day<start): continue
+            if end and (not day or day>end): continue
+            row=dict(r); row["observed_delay_min"]=float(row["delay_min"]); exposure=0.85 if row["mode"].lower()=="bus" else 0.35 if row["mode"].lower()=="tram" else 0.08 if row["mode"].lower()=="metro" else 0.12
+            row["delay_min"]=float(row["delay_min"])+traffic/100*8*exposure+rain/100*3*exposure
+            result.append(row)
+        return result
+    def do_GET(self):
+        global DATA, AUDIT
+        path=urlparse(self.path).path
+        if path=="/api/analytics":
+            data=self.filtered(parse_qs(urlparse(self.path).query)); self.send(200,json.dumps(analytics(data))); return
+        if path=="/api/data": self.send(200,json.dumps(self.filtered(parse_qs(urlparse(self.path).query)))); return
+        if path=="/api/sample":
+            DATA=make_demo(); AUDIT={"input":len(DATA),"valid":len(DATA),"rejected":0,"duplicates":0,"retention":100,"imputed":0,"source":"Generated sample"}; self.send(200,json.dumps(analytics(DATA))); return
+        if path=="/": self.send(200,(ROOT/"index.html").read_bytes(),"text/html; charset=utf-8"); return
+        if path=="/style.css": self.send(200,(ROOT/"style.css").read_bytes(),"text/css; charset=utf-8"); return
+        if path=="/app.js": self.send(200,(ROOT/"app.js").read_bytes(),"text/javascript; charset=utf-8"); return
+        self.send(404,"{}")
+    def do_POST(self):
+        global DATA,AUDIT
+        if self.path=="/api/upload":
+            try:
+                payload=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+                DATA,AUDIT=clean_csv(payload.get("csv","")); AUDIT["source"]=payload.get("name","Uploaded CSV")
+                self.send(200,json.dumps(analytics(DATA)))
+            except Exception as e: self.send(400,json.dumps({"error":str(e)}))
+        elif self.path=="/api/ask":
+            try:
+                payload=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+                q=payload.get("question","").lower().strip(); a=analytics(self.filtered({k:[str(v)] for k,v in payload.get("filters",{}).items()})); k=a["kpis"]
+                if not q: answer="Type a question about the loaded transit data."
+                elif any(w in q for w in ("worst","unreliable","lowest","bad")):
+                    r=min(a["routes"],key=lambda x:x["otp"]); answer=f"{r['route_id']} ({r['name']}) has the lowest on-time performance at {r['otp']}%, with a mean delay of {r['mean']} minutes and a 95th-percentile delay of {r['p95']} minutes."
+                elif any(w in q for w in ("best","reliable","highest","top")):
+                    r=max(a["routes"],key=lambda x:x["otp"]); answer=f"{r['route_id']} ({r['name']}) has the highest on-time performance at {r['otp']}%, based on {r['trips']:,} trips."
+                elif "forecast" in q or "predict" in q: answer=f"The 48-hour forecast starts at {a['forecast'][0]['delay']} minutes average delay and ends at {a['forecast'][-1]['delay']} minutes. It is a seasonal baseline estimate, not a live service prediction."
+                elif "bti" in q or "buffer" in q: answer=f"Network Buffer Time Index is {k['bti']}. The mean delay is {k['mean']} minutes and the 95th-percentile delay is {k['p95']} minutes. Higher BTI means more buffer is needed to cover delay variability."
+                elif "wait" in q or "bunch" in q: answer=f"Estimated Excess Wait Time is {k['ewt']} minutes{'' if k['ewt'] else ' (headway data is missing or insufficient)'}."
+                elif "otp" in q or "on time" in q or "punctual" in q: answer=f"Network on-time performance is {k['otp']}%, using the report's window of 1 minute early through 5 minutes late."
+                elif "compare" in q and ("bus" in q or "metro" in q):
+                    buckets={}
+                    for row in self.filtered({k:[str(v)] for k,v in payload.get("filters",{}).items()}): buckets.setdefault(row["mode"],[]).append(float(row["delay_min"]))
+                    parts=[]
+                    for m,v in buckets.items():
+                        if m.lower() in ("bus","metro"):
+                            otp=100*sum(-1<=x<=5 for x in v)/len(v)
+                            parts.append(f"{m}: {otp:.1f}% on-time; {statistics.mean(v):.2f} min average delay across {len(v)} trips")
+                    answer="Mode comparison — "+("; ".join(parts) if parts else "no bus or metro rows match the current filters.")
+                elif "rain" in q or "weather" in q:
+                    rows=self.filtered({k:[str(v)] for k,v in payload.get("filters",{}).items()}); buckets={}
+                    for row in rows:
+                        w=row.get("weather", "Unknown").lower(); buckets.setdefault(w,[]).append(float(row["delay_min"]))
+                    answer="Observed average delays by weather: "+("; ".join(f"{w}: {statistics.mean(v):.2f} min ({len(v)} trips)" for w,v in buckets.items()) if buckets else "no matching rows.") + " This is an association in the uploaded data, not proof that weather caused the delays."
+                elif "route" in q: answer=f"There are {k['routes']} routes in this data. " + "; ".join(f"{r['route_id']}: {r['otp']}% OTP" for r in sorted(a["routes"],key=lambda x:-x["otp"]))
+                else: answer=f"For {k['trips']:,} valid trips across {k['routes']} routes, network OTP is {k['otp']}%, mean delay is {k['mean']} minutes, and 95th-percentile delay is {k['p95']} minutes. Try asking which route is best or worst, the OTP, buffer index, wait time, or forecast."
+                self.send(200,json.dumps({"answer":answer}))
+            except Exception as e: self.send(400,json.dumps({"error":str(e)}))
+        else: self.send(404,"{}")
+
+if __name__=="__main__":
+    DATA=make_demo(); AUDIT={"input":len(DATA),"valid":len(DATA),"rejected":0,"duplicates":0,"retention":100,"imputed":0,"source":"Generated sample"}
+    port = int(os.environ.get("PORT", "8000"))
+    print(f"Transit Reliability Analyzer running at http://localhost:{port}")
+    ThreadingHTTPServer(("127.0.0.1",port),Handler).serve_forever()
